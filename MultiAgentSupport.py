@@ -1,6 +1,7 @@
 # ==================================================
 # 一个多Agent的智能客服系统
 # ==================================================
+from datetime import datetime
 import json
 import os
 from typing import TypedDict, List, Dict, Any, Literal
@@ -11,6 +12,7 @@ from langchain.tools import tool
 from langchain.agents import create_agent
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langgraph.constants import START, END
 from langgraph.graph import StateGraph
 
 import PROMPT_TEMPLATE
@@ -58,9 +60,9 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 if not DEEPSEEK_API_KEY:
     raise ValueError("未找到DEEPSEEK_API_KEY。")
 model = init_chat_model(
-    "deepseek:deepseek-v4-flash",
+    "deepseek:deepseek-chat",
     api_key=DEEPSEEK_API_KEY,
-    temperature=0.1
+    temperature=0.1,
 )
 os.environ['LANGGRAPH_ALLOWED_OBJECTS'] = 'messages'    # 这个是为了解决LangChainPendingDeprecationWarning
 
@@ -143,12 +145,11 @@ def query_order(order_id: str) -> str:
     return f"未找到订单 {order_id}"
 
 @tool
-def track_shipping(tracking_number: str, status: str) -> str:
+def track_shipping(tracking_number: str) -> str:
     """查询物流信息
 
     Args:
         tracking_number: 物流单号
-        status: 物流状态
     Returns:
         物流状态信息
     """
@@ -160,7 +161,7 @@ def track_shipping(tracking_number: str, status: str) -> str:
     for item in tracking_list:
         for track, track_name in item.items():
             if tracking_number.startswith(track):
-                return f"{track_name} {tracking_number}: {status}"
+                return f"{track_name} {tracking_number}: 已签收。"
     return f"未找到物流信息 {tracking_number}"
 
 @tool
@@ -180,9 +181,9 @@ def search_product(keyword: str) -> str:
                 "rating": f"{info["rating"]}分",
             })
 
-        if results:
-            return json.dumps(results, ensure_ascii=False, indent=2)
-        return f"未找到包含 '{keyword}' 的商品。"
+    if results:
+        return json.dumps(results, ensure_ascii=False, indent=2)
+    return f"未找到包含 '{keyword}' 的商品。"
 
 @tool
 def get_product_recommendations(budget: int, category: str = "全部") -> str:
@@ -218,7 +219,7 @@ def search_faq(problem_type: str) -> str:
     for key, answer in FAQ_DATABASE.items():
         if problem_type in key or key in problem_type:
             return f"【{key}】\n{answer}"
-        return "未找到相关FAQ，建议联系人工客服获取帮助。"
+    return "未找到相关FAQ，建议联系人工客服获取帮助。"
 
 
 # ==================== 2. 状态定义 ====================
@@ -276,15 +277,15 @@ class OrderServiceAgent:
             system_prompt=self.system_prompt,
         )
 
-        def handle(self, message: str, chat_history: List = None) -> str:
-            """ 处理订单服务请求 """
-            messages = [{"role": "user", "content": message}]
-            result = self.agent.invoke({"messages": messages})
+    def handle(self, message: str, chat_history: List = None) -> str:
+        """ 处理订单服务请求 """
+        messages = [{"role": "user", "content": message}]
+        result = self.agent.invoke({"messages": messages})
 
-            # 提取最终回复
-            if result["messages"]:
-                return result["messages"][-1].content
-            return "抱歉，订单查询服务暂不可用，请稍候再试。"
+        # 提取最终回复
+        if result["messages"]:
+            return result["messages"][-1].content
+        return "抱歉，订单查询服务暂不可用，请稍候再试。"
 
 
 # 3.3 技术支持Agent
@@ -448,4 +449,210 @@ class CustomerServiceSystem:
 感谢您的耐心等待！"""
             return state
 
+        def quality_check(state: CustomerServiceState) -> CustomerServiceState:
+            """ 质量检查 """
+            print("检查生成内容的置信度...")
+            result = self.qualityChecker.check(
+                state["user_message"],
+                state["agent_response"]
+            )
+            state["quality_score"] = result.get("total_score", 0) / 100
+
+            # 质量太低需要转人工
+            if result.get("needs_human_operator", False) or state["quality_score"] < 0.5:
+                state["needs_human_operator"] = True
+                state["human_operator_reason"] = result.get("reason", "质量检验未通过")
+
+            print(f"质量评分：{state["quality_score"]:.2f}")
+            return state
+
+        def need_human_operator_handler(state: CustomerServiceState) -> Literal["final_human", "respond"]:
+            """ 判断是否需要转人工 """
+            if state["needs_human_operator"]:
+                return "final_human"
+            return "respond"
+
+        def final_human_handler(state: CustomerServiceState) -> CustomerServiceState:
+            """ 最终转人工处理 """
+            original_response = state["agent_response"]
+            if original_response:
+                state["agent_response"] = f"""{original_response}
+=======
+系统提示：由于此问题需要更专业的处理，我们建议您联系人工客服以获得更好地服务。
+"""
+            else:
+                state["agent_response"] = f"""
+=======
+系统提示：由于此问题需要更专业的处理，我们建议您联系人工客服以获得更好地服务。
+"""
+            return state
+
+        def respond(state: CustomerServiceState) -> CustomerServiceState:
+            """ 最终响应 """
+            return state
+
+        graph = StateGraph(CustomerServiceState)
+
+        # 添加节点
+        graph.add_node("classify_intent", classify_intent)
+        graph.add_node("order_service", order_service_handler)
+        graph.add_node("tech_support", tech_support_handler)
+        graph.add_node("product_consult", product_consult_handler)
+        graph.add_node("human_operator", human_operator_handler)
+        graph.add_node("quality_check", quality_check)
+        graph.add_node("final_human", final_human_handler)
+        graph.add_node("respond", respond)
+
+        graph.add_edge(START, "classify_intent")
+        # 意图识别后添加分支
+        graph.add_conditional_edges(
+            "classify_intent",
+            route_to_agent,
+            {
+                "order_service": "order_service",
+                "tech_support": "tech_support",
+                "product_consult": "product_consult",
+                "human_operator": "human_operator",
+            }
+        )
+        graph.add_edge("order_service", "quality_check")
+        graph.add_edge("tech_support", "quality_check")
+        graph.add_edge("product_consult", "quality_check")
+        graph.add_edge("human_operator", END)
+
+        # 质量检查后的条件路由
+        graph.add_conditional_edges(
+            "quality_check",
+            need_human_operator_handler,
+            {
+                "final_human": "final_human",
+                "respond": "respond"
+            }
+        )
+
+        graph.add_edge("final_human", END)
+        graph.add_edge("respond", END)
+
+        return graph.compile()
+
+    def handle_message(self, message: str, chat_history: List[Dict] = None) -> Dict[str, Any]:
+        """处理用户消息"""
+        print("=" * 50)
+        print(f"用户消息：{message}")
+        print("=" * 50)
+
+        initial_state = {
+            "user_message": message,
+            "chat_history": chat_history or [],
+            "intent": "",
+            "confidence": 0.0,
+            "agent_response": "",
+            "needs_human_operator": False,
+            "human_operator_reason": "",
+            "quality_score": 0.0,
+            "metadata": {"timestamp": datetime.now().isoformat()}
+        }
+
+        result = self.graph.invoke(initial_state)
+
+        return {
+            "response": result["agent_response"],
+            "intent": result["intent"],
+            "confidence": result["confidence"],
+            "quality_score": result["quality_score"],
+            "needs_human_operator": result["needs_human_operator"],
+        }
+
+
+# ==================== 5. 主程序 ====================
+
+def main():
+    """ 演示多Agent客服系统 """
+
+    system = CustomerServiceSystem()
+
+    # 测试场景
+    test_cases = [
+        # 订单服务场景（关键词：订单、物流、什么时候到、快递）
+        {
+            "category": "订单服务",
+            "messages": [
+                "帮我查一下订单 ORD001 的物流状态",
+                "我的订单什么时候能到？订单号是 ORD002",
+                "ORD003 发货了吗？",
+                "能查一下快递到哪了吗？单号 SF1234567890",
+                "我要退货，订单 ORD001 怎么办理？"
+            ]
+        },
+        # 技术支持场景（关键词：连不上、坏了、怎么用、设置、更新、充电慢）
+        {
+            "category": "技术支持",
+            "messages": [
+                "我的蓝牙耳机连接不上手机怎么办？",
+                "手表充电很慢，是不是坏了？",
+                "APP 连不上设备，显示配对失败",
+                "怎么恢复出厂设置？",
+                "固件更新到一半卡住了",
+                "耳机左边没声音了"
+            ]
+        },
+        # 产品咨询场景（关键词：怎么样、好用吗、多少钱、推荐、哪个好、功能、参数）
+        {
+            "category": "产品咨询",
+            "messages": [
+                "你们有什么智能手表推荐吗？预算1500左右",
+                "无线耳机有什么功能？",
+                "智能手表 Pro 和普通版有什么区别？",
+                "这个充电宝支持快充吗？",
+                "智能音箱音质怎么样？",
+                "哪款耳机续航最长？",
+                "¥499 的音箱和 ¥899 的耳机哪个更值得买？"
+            ]
+        },
+        # 人工升级场景（关键词：投诉、人工、客服、垃圾、差评、情绪激动、经理）
+        {
+            "category": "人工升级",
+            "messages": [
+                "我要投诉！这是第三次出问题了！",
+                "我想和你们经理谈谈",
+                "转人工客服！",
+                "你们这什么垃圾产品，我要退货！",
+                "再解决不了我就去315投诉",
+                "你们客服都是机器人吗？来个人说话！",
+                "气死我了，这个问题折腾三天了"
+            ]
+        },
+        # 边界模糊场景（测试分类准确性）
+        {
+            "category": "边界测试",
+            "messages": [
+                "我的订单 ORD002 的手表连不上手机",  # 订单+技术，应优先技术还是订单？
+                "推荐一个能连蓝牙的充电宝",  # 产品+技术
+                "我收到的耳机是坏的，怎么退货？",  # 售后+技术+订单
+                "这手表防水吗？不小心掉水里了",  # 产品+技术
+                "1500预算买什么？要能测心率的"  # 产品咨询
+            ]
+        }
+    ]
+
+    # 运行测试
+    for test in test_cases:
+        print("=" * 50)
+        print(f"测试类别: {test['category']}")
+        print("=" * 50)
+
+        for message in test["messages"]:
+            result = system.handle_message(message)
+
+            print("\nAgent回复:")
+            print(f"{result['response']}")
+            print("\nAgent处理:")
+            print(f"   - 意图: {result['intent']}")
+            print(f"   - 置信度: {result['confidence']:.2f}")
+            print(f"   - 质量评分: {result['quality_score']:.2f}")
+            print(f"   - 是否转人工: {'是' if result['needs_human_operator'] else '否'}")
+            print("=" * 50)
+
+if __name__ == "__main__":
+    main()
 
